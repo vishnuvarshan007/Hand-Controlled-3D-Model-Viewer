@@ -29,5 +29,3 @@ Built with **OpenGL, PyWavefront, and MediaPipe**, featuring a simple **Tkinter 
 - [Tkinter](https://wiki.python.org/moin/TkInter) (GUI)
 
 ---
-
-## 📂 Project Structure
