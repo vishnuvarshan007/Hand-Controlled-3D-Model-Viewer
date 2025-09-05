@@ -45,16 +45,27 @@ Built with **Python, OpenGL, MediaPipe, and Socket.IO**, this project allows mul
 ├── notes/ # Saved user notes
 └── assets/ # Sample 3D models and textures
 
-## Dependencies
 
-opencv-python – Camera input
-mediapipe – Hand tracking
-numpy, PIL – Image processing
-PyOpenGL, pywavefront – 3D rendering
-socketio, eventlet – Networking
-psutil, GPUtil – System stats
-tkinter – File dialogs & UI
-(optional) speech_recognition, pyttsx3
+---
+
+## 📦 Dependencies
+
+- **opencv-python** – Camera input  
+- **mediapipe** – Hand tracking  
+- **numpy, PIL** – Image processing  
+- **PyOpenGL, pywavefront** – 3D rendering  
+- **socketio, eventlet** – Networking  
+- **psutil, GPUtil** – System stats  
+- **tkinter** – File dialogs & UI  
+- *(optional)* **speech_recognition, pyttsx3** – Voice input/output  
+
+---
+
+## 🚀 Run the application
+
+```bash
+python main.py
+
 
 ## Run the application:
 python main.py
