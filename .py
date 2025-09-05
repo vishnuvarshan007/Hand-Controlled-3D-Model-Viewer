@@ -9,6 +9,13 @@ import random
 import cv2
 import numpy as np
 from PIL import Image
+import socketio
+import eventlet
+import psutil
+import io
+import GPUtil
+import tempfile, zipfile, base64
+
 
 # MediaPipe
 import mediapipe as mp
@@ -55,6 +62,33 @@ CAM_DOWNSCALE = (640, 480)
 MEDIAPIPE_EVERY_N = 2
 SHOW_DEBUG_WINDOW = False
 PINCH_PIXEL_THRESHOLD = 40
+current_model_zip = None
+
+# ---------------- HUD state ----------------
+last_alert_time = 0
+last_frame_time = time.time()
+fps = 0
+frame_time_ms = 0.0
+fps_display, frame_ms = 0.0, 0.0
+connected_clients = {}
+
+sidebar_visible = False
+sidebar_alpha = 0.0
+sidebar_target_alpha = 0.0
+sidebar_last_time = time.time()
+
+SYSTEM_STATS = {
+    "cpu": 0.0,
+    "mem": 0.0,
+    "gpu": -1.0
+}
+
+# ---------------- Collaboration Server ----------------
+SERVER_HOST = "0.0.0.0"
+SERVER_PORT = 5000
+sio = socketio.Server(cors_allowed_origins="*")
+app = socketio.WSGIApp(sio)
+
 
 # ---------------- view state ----------------
 @dataclass
@@ -73,6 +107,170 @@ class Smoothing:
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
+last_broadcast_time = 0
+def broadcast_state(throttle=0.05):
+    global last_broadcast_time
+    now = time.time()
+    if now - last_broadcast_time < throttle:
+        return
+    try:
+        sio.emit("state", shared_state)
+        last_broadcast_time = now
+    except Exception as e:
+        print("[broadcast_state] emit error:",e)
+
+
+# ---------------- Collaboration Server ----------------
+
+
+def package_model_with_assets(obj_path):
+    print("[server] Packaging model and assets...")
+    """Create a zip containing OBJ, MTL, and textures."""
+    base_dir = os.path.dirname(obj_path)
+    zip_bytes = io.BytesIO()
+    with zipfile.ZipFile(zip_bytes, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # OBJ
+        zipf.write(obj_path, os.path.basename(obj_path))
+        mtl_file = None
+        with open(obj_path, "r") as f:
+            for line in f:
+                if line.lower().startswith("mtllib"):
+                    mtl_file = line.split()[1].strip()
+                    break
+        if mtl_file and os.path.exists(os.path.join(base_dir, mtl_file)):
+            mtl_path = os.path.join(base_dir, mtl_file)
+            zipf.write(mtl_path, os.path.basename(mtl_path))
+            # Textures from MTL
+            with open(mtl_path, "r") as mf:
+                for line in mf:
+                    if line.lower().startswith("map_kd"):
+                        tex = line.split()[1].strip()
+                        tex_path = os.path.join(base_dir, tex)
+                        if os.path.exists(tex_path):
+                            zipf.write(tex_path, os.path.basename(tex_path))
+    zip_bytes.seek(0)
+    return zip_bytes.read()
+
+current_model_version = 0
+
+def send_model_to_clients(obj_path):
+    print("[server] Sending model to clients:", obj_path)
+    global current_model_zip, current_model_version
+    try:
+        current_model_zip = package_model_with_assets(obj_path)
+        current_model_version += 1
+        encoded = base64.b64encode(current_model_zip).decode("utf-8")
+        sio.emit("model_data", {"zip": encoded, "version": current_model_version})
+        print(f"[server] Broadcasted new model v{current_model_version}: {obj_path}")
+    except Exception as e:
+        print("[server] Failed to package model:",e)
+
+@sio.event
+def connect(sid, environ, auth=None):
+    ip_port = f"{environ.get('REMOTE_ADDR', 'unknown')}:{environ.get('REMOTE_PORT', 'unknown')}"
+    print(f"[server] Client connected: sid={sid}, ip_port={ip_port}, headers={environ.get('HTTP_USER_AGENT', 'unknown')}")
+    # Check if client IP/port already received the current model version
+    for existing_sid, info in list(connected_clients.items()):
+        if info["ip_port"] == ip_port and info["version"] >= current_model_version:
+            print(f"[server] Client {ip_port} already has model version {info['version']}, skipping model_data for sid={sid}")
+            connected_clients[sid] = {"version": info["version"], "ip_port": ip_port}
+            sio.emit("state", shared_state, to=sid)
+            return
+    connected_clients[sid] = {"version": 0, "ip_port": ip_port}
+    if current_model_zip and connected_clients[sid]["version"] < current_model_version:
+        encoded = base64.b64encode(current_model_zip).decode("utf-8")
+        print(f"[server] Sending model to client {sid}, version: {current_model_version}")
+        sio.emit("model_data", {"zip": encoded, "version": current_model_version}, to=sid)
+        connected_clients[sid]["version"] = current_model_version
+    else:
+        print(f"[server] No model loaded or client already has model (version {connected_clients[sid]['version']}), skipping model_data for sid={sid}")
+    sio.emit("state", shared_state, to=sid)
+# Client-side handler (runs in all instances, including host)
+
+@sio.on("state")
+def on_state(sid, data):
+    global shared_state
+    # Validate and sanitize incoming data here if you want
+    shared_state.update(data)
+    shared_state["server_time"] = time.time()
+    # Broadcast new state to all other clients except sender
+    sio.emit("state", shared_state, skip_sid=sid)
+
+@sio.on("state")
+def on_state(sid, data):
+    global shared_state
+    shared_state.update(data)
+    shared_state["server_time"] = time.time()
+    # Broadcast to all other clients except sender
+    sio.emit("state", shared_state, skip_sid=sid)
+
+
+@sio.on("state")
+def handle_state(sid, data):
+    global shared_state
+    # Run safety checks
+    alerts = run_safety_checks(shared_state, data)
+    data["alerts"] = alerts
+
+    # Update server copy of state
+    shared_state.update(data)
+    shared_state["server_time"] = time.time()
+
+    print(f"[server] State update from {sid}: {data}")
+
+    # Broadcast new state to all clients (except sender)
+    sio.emit("state", shared_state, skip_sid=sid)
+
+@sio.on("model_data")
+def on_model_data(data):
+    print("[client] Received model data from server")
+    try:
+        raw = base64.b64decode(data["zip"])
+        tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp_zip.write(raw)
+        tmp_zip.close()
+        extract_dir = tempfile.mkdtemp()
+        with zipfile.ZipFile(tmp_zip.name, "r") as zf:
+            zf.extractall(extract_dir)
+        # Find obj inside extracted
+        for f in os.listdir(extract_dir):
+            if f.endswith(".obj"):
+                obj_path = os.path.join(extract_dir, f)
+                load_obj(obj_path)  # reuse your loader
+                break
+        print("[client] Model updated from server")
+    except Exception as e:
+        print("[client] Failed to load model from server:", e)
+
+def start_server():
+    print(f"[server] Running on {SERVER_HOST}:{SERVER_PORT}")
+    eventlet.wsgi.server(eventlet.listen((SERVER_HOST, SERVER_PORT)), app)
+
+threading.Thread(target=start_server, daemon=True).start()
+
+
+
+def parse_obj(path):
+    print(f"Parsing OBJ: {path}")
+    vertices, faces = [], []
+    with open(path, "r") as f:
+        for line in f:
+            if line.startswith("v "):  # vertex
+                _, x, y, z = line.split()
+                vertices.append([float(x), float(y), float(z)])
+            elif line.startswith("f "):  # face
+                parts = [p.split("/")[0] for p in line.split()[1:]]
+                faces.append([int(p) - 1 for p in parts])  # 0-indexed
+    return {"vertices": vertices, "faces": faces}
+
+def choose_model():
+    print("Choose model file...")
+    path = filedialog.askopenfilename(filetypes=[("OBJ files", "*.obj")])
+    if path:
+        load_obj(path)             # load locally
+        send_model_to_clients(path)  # broadcast
+
 
 # ---------------- global state ----------------
 class AppState:
@@ -125,6 +323,61 @@ STATE = AppState()
 
 NOTES_DIR = os.path.join(os.getcwd(), "notes")
 os.makedirs(NOTES_DIR, exist_ok=True)
+
+# Shared state that all clients will see
+shared_state = {
+    "rot_x": STATE.view.rot_x,
+    "rot_y": STATE.view.rot_y,
+    "dist": STATE.view.dist,
+    "alerts": [],
+}
+
+
+def get_system_stats():
+    cpu = psutil.cpu_percent()
+    mem = psutil.virtual_memory().percent
+    gpu = 0
+    try:
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            gpu = gpus[0].load * 100
+    except Exception as e:
+        gpu = -1  # means unavailable
+    return cpu, mem, gpu
+
+def poll_system_stats():
+    while True:
+        try:
+            SYSTEM_STATS["cpu"] = psutil.cpu_percent(interval=0.5)
+            SYSTEM_STATS["mem"] = psutil.virtual_memory().percent
+            gpu_load = -1.0
+            try:
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu_load = gpus[0].load * 100
+            except Exception:
+                gpu_load = -1.0
+            SYSTEM_STATS["gpu"] = gpu_load
+        except Exception:
+            SYSTEM_STATS["cpu"] = 0.0
+            SYSTEM_STATS["mem"] = 0.0
+            SYSTEM_STATS["gpu"] = -1.0
+        time.sleep(1.0)
+
+threading.Thread(target=poll_system_stats, daemon=True).start()
+
+
+def update_fps():
+    """Update FPS and frame time every 0.5s."""
+    global last_fps_time, frame_count, fps_display, frame_ms
+    frame_count += 1
+    now = time.time()
+    if now - last_fps_time >= 0.5:
+        fps_display = frame_count / (now - last_fps_time)
+        frame_ms = 1000.0 / fps_display if fps_display > 0 else 0
+        frame_count = 0
+        last_fps_time = now
+    return fps_display, frame_ms
 
 # ---------------- model helpers ----------------
 def compute_bbox(scene):
@@ -236,8 +489,26 @@ def draw_sky_background():
     glMatrixMode(GL_MODELVIEW)
     glEnable(GL_DEPTH_TEST)
 
+
+
+# ---------------- safety checks ----------------
+def run_safety_checks(prev_state, new_state):
+    alerts = []
+    # 1. Zoom too close or too far
+    if new_state["dist"] < 5.0:
+        alerts.append("⚠️ Too close – clipping risk")
+    if new_state["dist"] > 30.0:
+        alerts.append("⚠️ Too far – model may disappear")
+
+
+    # 2. Rotation too fast (threshold: >15 deg/frame)
+    if abs(new_state["rot_x"] - prev_state["rot_x"]) > 15 or abs(new_state["rot_y"] - prev_state["rot_y"]) > 15:
+        alerts.append("⚠️ Unstable manipulation (rotation too fast)")
+
+    return alerts
+
 # ---------------- OpenGL rendering ----------------
-WINDOW_W, WINDOW_H = 1280, 720
+WINDOW_W, WINDOW_H = 640, 480
 
 def init_gl(w, h):
     glEnable(GL_DEPTH_TEST)
@@ -262,124 +533,156 @@ def resize_gl(w,h):
     gluPerspective(45.0, float(w)/float(h), 0.05, 100.0)
     glMatrixMode(GL_MODELVIEW)
 
-def set_bg():
-    if STATE.bg_mode==0: glClearColor(0.05,0.05,0.08,1.0)
-    else: glClearColor(0.95,0.95,0.98,1.0)
-
 def draw_hud():
-    # top-right HUD with model info, fps, rot, dist
+    global last_alert_time, last_frame_time, fps, frame_time_ms
+
+    # --- FPS / frame timing ---
+    now = time.time()
+    dt = now - last_frame_time
+    last_frame_time = now
+    if dt > 0:
+        fps = int(1.0 / dt)
+        frame_time_ms = dt * 1000.0
+    cpu = SYSTEM_STATS["cpu"]
+    mem = SYSTEM_STATS["mem"]
+    gpu = SYSTEM_STATS["gpu"]
+
+
+    # Projection setup
     glMatrixMode(GL_PROJECTION)
     glPushMatrix()
     glLoadIdentity()
-    glOrtho(0, WINDOW_W, WINDOW_H, 0, -1, 1)
+    gluOrtho2D(0, WINDOW_W, 0, WINDOW_H)
     glMatrixMode(GL_MODELVIEW)
     glPushMatrix()
     glLoadIdentity()
-
     glDisable(GL_LIGHTING)
-    if STATE.bg_mode==0:
-        glColor3f(1,1,1)
-    else:
-        glColor3f(0.08,0.08,0.08)
 
-    def text(x,y,s):
-        glRasterPos2f(x,y)
-        for ch in s:
-            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, ord(ch))
+    def draw_text(x, y, text, color=(1, 1, 1), size=0.15):
+        glPushAttrib(GL_CURRENT_BIT)  # isolate color state
+        glColor3f(*color)
+        glPushMatrix()
+        glTranslatef(x, y, 0)
+        glScalef(size, size, size)
+        for ch in text:
+            glutStrokeCharacter(GLUT_STROKE_ROMAN, ord(ch))
+        glPopMatrix()
+        glPopAttrib()
 
-    # draw top-right; leave some padding
-    x = WINDOW_W - 320
-    y0 = 18
-    text(x, y0, f"Model: {STATE.model_name}")
-    text(x, y0+20, f"FPS: {STATE.current_fps:.1f}")
-    text(x, y0+40, f"RotX: {STATE.view.rot_x:.1f}")
-    text(x, y0+60, f"RotY: {STATE.view.rot_y:.1f}")
-    text(x, y0+80, f"Dist: {STATE.view.dist:.2f}")
-    text(x, y0+100, f"Gesture: {STATE.current_gesture}")
+    # --- Status ---
+    draw_text(20, WINDOW_H - 80, f"Gesture: {STATE.current_gesture}", color=(0.6, 1, 0.6))
+    draw_text(20, WINDOW_H - 110, f"Action: {STATE.last_action_message}", color=(1, 1, 0.5))
 
+    # --- Alerts ---
+    if shared_state.get("alerts"):
+        t = time.time()
+        pulse = (abs((t * 2) % 2 - 1)) * 0.5 + 0.5  # 0.5–1.0 pulsing
+        for i, msg in enumerate(shared_state["alerts"]):
+            draw_text(
+                20, 40 + i * 40,
+                msg,
+                color=(1, pulse * 0.3, pulse * 0.3),  # pulsing red
+                size=0.18
+            )
+
+    # --- Developer Info ---
+    draw_text(WINDOW_W - 220, WINDOW_H - 40, f"FPS: {fps}", color=(0.8, 0.8, 0.8), size=0.15)
+    draw_text(WINDOW_W - 220, WINDOW_H - 70, f"Frame: {frame_time_ms:.2f} ms", color=(0.8, 0.8, 0.8), size=0.15)
+    draw_text(WINDOW_W - 220, WINDOW_H - 100, f"CPU: {cpu:.1f}%", color=(0.8, 0.8, 0.8), size=0.15)
+    draw_text(WINDOW_W - 220, WINDOW_H - 140, f"MEM: {mem:.1f}%", color=(0.8, 0.8, 0.8), size=0.15)
+    draw_text(WINDOW_W - 220, WINDOW_H - 170, f"GPU: {gpu:.1f}%", color=(0.8, 0.8, 0.8), size=0.15)
+
+    if cpu > 85:
+        draw_text(20, WINDOW_H - 250, "⚠ CPU Overload!", color=(1, 0.2, 0.2), size=0.3)
+    if gpu > 90:
+        draw_text(20, WINDOW_H - 300, "⚠ GPU Overload!", color=(1, 0.2, 0.2), size=0.3)
+
+    # Optional: latency (if server sends timestamps)
+    if "server_time" in shared_state:
+        latency = (time.time() - shared_state["server_time"]) * 1000.0
+        draw_text(WINDOW_W - 220, WINDOW_H - 100, f"Latency: {latency:.1f} ms", color=(0.9, 0.9, 0.5), size=0.15)
+
+    # Restore state
     glEnable(GL_LIGHTING)
     glPopMatrix()
     glMatrixMode(GL_PROJECTION)
     glPopMatrix()
     glMatrixMode(GL_MODELVIEW)
 
-def draw_sidebar_overlay():
-    # Animate sidebar x position
+def draw_sidebar():
+    # Animate slide
     if STATE.sidebar_anim_x < STATE.sidebar_target_x:
-        STATE.sidebar_anim_x += STATE.sidebar_speed
-        if STATE.sidebar_anim_x > STATE.sidebar_target_x:
-            STATE.sidebar_anim_x = STATE.sidebar_target_x
+        STATE.sidebar_anim_x = min(STATE.sidebar_anim_x + STATE.sidebar_speed, STATE.sidebar_target_x)
     elif STATE.sidebar_anim_x > STATE.sidebar_target_x:
-        STATE.sidebar_anim_x -= STATE.sidebar_speed
-        if STATE.sidebar_anim_x < STATE.sidebar_target_x:
-            STATE.sidebar_anim_x = STATE.sidebar_target_x
+        STATE.sidebar_anim_x = max(STATE.sidebar_anim_x - STATE.sidebar_speed, STATE.sidebar_target_x)
 
+    # If fully closed, skip
     if STATE.sidebar_anim_x <= -300:
         return
 
+    width = 300
+
+    # Switch to 2D projection
     glMatrixMode(GL_PROJECTION)
     glPushMatrix()
     glLoadIdentity()
-    glOrtho(0, WINDOW_W, WINDOW_H, 0, -1, 1)
+    gluOrtho2D(0, WINDOW_W, 0, WINDOW_H)
     glMatrixMode(GL_MODELVIEW)
     glPushMatrix()
     glLoadIdentity()
 
+    # Save state
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT)
+
+    # Sidebar background (semi-transparent panel only, no full-screen clear)
+    glDisable(GL_DEPTH_TEST)
     glDisable(GL_LIGHTING)
-    sidebar_w = 300
-    if STATE.bg_mode == 0:
-        glColor4f(0.06, 0.06, 0.08, 0.95)
-    else:
-        glColor4f(0.96, 0.96, 0.98, 0.95)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    glColor4f(0.08, 0.08, 0.15, 0.9)  # Dark translucent panel
     glBegin(GL_QUADS)
     glVertex2f(STATE.sidebar_anim_x, 0)
-    glVertex2f(STATE.sidebar_anim_x + sidebar_w, 0)
-    glVertex2f(STATE.sidebar_anim_x + sidebar_w, WINDOW_H)
+    glVertex2f(STATE.sidebar_anim_x + width, 0)
+    glVertex2f(STATE.sidebar_anim_x + width, WINDOW_H)
     glVertex2f(STATE.sidebar_anim_x, WINDOW_H)
     glEnd()
 
-    if STATE.bg_mode == 0:
-        glColor3f(1, 1, 1)
-    else:
-        glColor3f(0.08, 0.08, 0.08)
+    # Text helper
+    def draw_text(x, y, text, color=(1, 1, 1), size=0.3):
+        glColor3f(*color)
+        glPushMatrix()
+        glTranslatef(STATE.sidebar_anim_x + x, y, 0)
+        glScalef(size, size, size)
+        for ch in text:
+            glutStrokeCharacter(GLUT_STROKE_ROMAN, ord(ch))
+        glPopMatrix()
 
-    def text(x, y, s):
-        glRasterPos2f(STATE.sidebar_anim_x + x, y)
-        for ch in s:
-            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, ord(ch))
-
-    text(12, 36, "Sidebar - Options:")
-    text(12, 72, ( "[1]" if STATE.sidebar_selection==1 else "[ ]" ) + " 1 - Notes (speak to save)")
-    text(12, 100, ( "[2]" if STATE.sidebar_selection==2 else "[ ]" ) + " 2 - Drawing Mode (placeholder)")
-    text(12, 128, ( "[3]" if STATE.sidebar_selection==3 else "[ ]" ) + " 3 - Close Sidebar")
-    text(12, 160, "Status:")
-    if STATE.is_recording_note:
-        text(12, 188, "Recording note... (listening)")
-    else:
-        preview = STATE.last_note_preview or "(no notes saved yet)"
-        if len(preview) > 80:
-            preview = preview[:77] + "..."
-        text(12, 188, "Last note:")
-        text(12, 206, preview)
+    # Sidebar content
+    draw_text(20, WINDOW_H - 120, "== Sidebar Menu ==", color=(0.2, 0.8, 1), size=0.3)
+    draw_text(20, WINDOW_H - 200, "1. Notes", color=(1, 1, 1), size=0.20)
+    draw_text(20, WINDOW_H - 260, "2. Drawing", color=(1, 1, 1), size=0.20)
+    draw_text(20, WINDOW_H - 320, "3. Close Sidebar", color=(1, 0.5, 0.5), size=0.20)
 
     if STATE.last_action_message:
-        text(12, WINDOW_H - 28, STATE.last_action_message)
+        draw_text(40, 150, f"> {STATE.last_action_message}", color=(0.9, 0.9, 0.6), size=0.25)
 
-    glEnable(GL_LIGHTING)
+    # Restore state
+    glPopAttrib()
     glPopMatrix()
     glMatrixMode(GL_PROJECTION)
     glPopMatrix()
     glMatrixMode(GL_MODELVIEW)
 
+
+
 def display():
-    set_bg()
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
     draw_sky_background()
     glLoadIdentity()
-    gluLookAt(0,0,STATE.view.dist,0,0,0,0,1,0)
-
-    glRotatef(STATE.view.rot_x,1,0,0)   # pitch
-    glRotatef(STATE.view.rot_y,0,1,0)   # yaw
+    gluLookAt(0,0,shared_state["dist"],0,0,0,0,1,0)
+    glRotatef(shared_state["rot_x"], 1, 0, 0)
+    glRotatef(shared_state["rot_y"], 0, 1, 0)
 
     if STATE.mesh_ready and STATE.model_scene:
         glPushMatrix()
@@ -406,7 +709,7 @@ def display():
         glutSolidTeapot(1.0)
 
     # draw overlays
-    draw_sidebar_overlay()
+    draw_sidebar()
     draw_hud()
 
     glutSwapBuffers()
@@ -458,33 +761,43 @@ def camera_worker(device_index=0):
 
 # ---------------- gesture detection ----------------
 def detect_hand_combination(lm, w, h):
-    # keeps old behaviour for directional gestures (thumb touching finger tips)
     thumb = lm[mp_hands.HandLandmark.THUMB_TIP]
     index = lm[mp_hands.HandLandmark.INDEX_FINGER_TIP]
     middle = lm[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
     ring = lm[mp_hands.HandLandmark.RING_FINGER_TIP]
     pinky = lm[mp_hands.HandLandmark.PINKY_TIP]
-    tx, ty = thumb.x*w, thumb.y*h
-    ix, iy = index.x*w, index.y*h
-    mx, my = middle.x*w, middle.y*h
-    rx, ry = ring.x*w, ring.y*h
-    px, py = pinky.x*w, pinky.y*h
-    d_index = math.hypot(tx-ix, ty-iy)
-    d_middle = math.hypot(tx-mx, ty-my)
-    d_ring = math.hypot(tx-rx, ty-ry)
-    d_pinky = math.hypot(tx-px, ty-py)
+
+    tx, ty = thumb.x * w, thumb.y * h
+    ix, iy = index.x * w, index.y * h
+    mx, my = middle.x * w, middle.y * h
+    rx, ry = ring.x * w, ring.y * h
+    px, py = pinky.x * w, pinky.y * h
+
+    d_index = math.hypot(tx - ix, ty - iy)
+    d_middle = math.hypot(tx - mx, ty - my)
+    d_ring = math.hypot(tx - rx, ty - ry)
+    d_pinky = math.hypot(tx - px, ty - py)
+
     threshold = PINCH_PIXEL_THRESHOLD
+
     # Directional (rotation/tilt)
-    if d_index<threshold and d_middle>threshold and d_ring>threshold and d_pinky>threshold: return "LEFT"
-    if d_middle<threshold and d_index>threshold and d_ring>threshold and d_pinky>threshold: return "RIGHT"
-    if d_ring<threshold and d_index>threshold and d_middle>threshold and d_pinky>threshold: return "UP"
-    if d_pinky<threshold and d_index>threshold and d_middle>threshold and d_ring>threshold: return "DOWN"
+    if d_index < threshold and d_middle > threshold and d_ring > threshold and d_pinky > threshold:
+        return "LEFT"
+    if d_middle < threshold and d_index > threshold and d_ring > threshold and d_pinky > threshold:
+        return "RIGHT"
+    if d_ring < threshold and d_index > threshold and d_middle > threshold and d_pinky > threshold:
+        return "UP"
+    if d_pinky < threshold and d_index > threshold and d_middle > threshold and d_ring > threshold:
+        return "DOWN"
+
     # Zoom gestures (new)
-    if d_index<ththreshold if False else d_index<threshold and d_middle<ththreshold if False else d_middle<threshold and d_ring>threshold and d_pinky>threshold:
-        return "ZOOM_IN"   # Thumb + Index + Middle
+    if d_index < threshold and d_middle < threshold and d_ring > threshold and d_pinky > threshold:
+        return "ZOOM_IN"
     if d_index < threshold and d_middle < threshold and d_ring < threshold and d_pinky > threshold:
-        return "ZOOM_OUT"  # Thumb + Index + Middle + Ring close
+        return "ZOOM_OUT"
+
     return None
+
 
 def is_finger_extended(landmarks, tip_idx, pip_idx):
     # In Mediapipe coordinates: y increases downward.
@@ -517,65 +830,37 @@ def count_extended_fingers(landmarks):
     return extended
 
 def start_note_recording_thread(note_file_path):
-    # spawn a thread to capture audio (or typed input fallback) and save to note file
+    """Spawn a thread to capture audio and transcribe it to text notes."""
     def worker():
         STATE.is_recording_note = True
         STATE.last_action_message = "Starting note capture..."
         speak("Starting note capture")
         text = ""
+
         if SR_AVAILABLE:
             try:
                 r = sr.Recognizer()
                 with sr.Microphone() as mic:
-                    STATE.last_action_message = "Listening..."
-                    speak("Listening")
-                    # adjust for ambient noise briefly
-                    r.adjust_for_ambient_noise(mic, duration=0.6)
-                    audio = r.listen(mic, phrase_time_limit=10)
-                STATE.last_action_message = "Recognizing..."
-                speak("Recognizing")
-                try:
-                    text = r.recognize_google(audio)
-                except Exception as e:
-                    STATE.last_action_message = f"Speech recog failed: {e}"
-                    text = ""
+                    r.adjust_for_ambient_noise(mic)
+                    audio = r.listen(mic, timeout=10, phrase_time_limit=30)
+                text = r.recognize_google(audio)
             except Exception as e:
-                STATE.last_action_message = f"Microphone error: {e}"
-                text = ""
+                text = f"[Error capturing note: {e}]"
         else:
-            # fallback to typed input dialog (non-blocking to GLUT: use tkinter in the thread)
-            try:
-                root = tk.Tk()
-                root.withdraw()
-                text = simpledialog.askstring("Notes (fallback)", "Speech not available. Type your note:")
-                try: root.destroy()
-                except: pass
-                if text is None:
-                    text = ""
-            except Exception as e:
-                print("Fallback dialog error:", e)
-                text = ""
+            text = "[SpeechRecognition not installed]"
 
-        # Save text (append) with timestamp
         try:
-            os.makedirs(os.path.dirname(note_file_path), exist_ok=True)
             with open(note_file_path, "a", encoding="utf-8") as f:
-                if text.strip():
-                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                    f.write(f"[{ts}] {text.strip()}\n")
-                    STATE.last_note_preview = text.strip()
-                    STATE.last_action_message = f"Note saved to {note_file_path}"
-                    speak("Note saved")
-                else:
-                    STATE.last_action_message = "No note captured"
-                    speak("No note captured")
+                f.write(text + "\n")
+            STATE.last_action_message = "Note saved!"
+            speak("Note saved")
         except Exception as e:
-            STATE.last_action_message = f"Error saving note: {e}"
-            speak("Error saving note")
+            STATE.last_action_message = f"Failed to save note: {e}"
+            speak("Failed to save note")
+
         STATE.is_recording_note = False
 
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
+    threading.Thread(target=worker, daemon=True).start()
 
 def update_from_last_hand():
     with STATE._lock:
@@ -594,7 +879,6 @@ def update_from_last_hand():
         STATE.last_action_message = "Sidebar opened"
         speak("Sidebar opened")
     elif extended_count == 3 and STATE.sidebar_open and STATE.sidebar_selection is None:
-        # If sidebar is open and no explicit option selected yet, treat 3-finger gesture as "close sidebar"
         STATE.sidebar_open = False
         STATE.sidebar_target_x = -300
         STATE.last_action_message = "Sidebar closed"
@@ -602,10 +886,21 @@ def update_from_last_hand():
 
     # If sidebar is open, check for selection gestures
     if STATE.sidebar_open:
-        # detect index, middle, ring extended
-        idx_extended = is_finger_extended(hl.landmark, mp_hands.HandLandmark.INDEX_FINGER_TIP, mp_hands.HandLandmark.INDEX_FINGER_PIP)
-        mid_extended = is_finger_extended(hl.landmark, mp_hands.HandLandmark.MIDDLE_FINGER_TIP, mp_hands.HandLandmark.MIDDLE_FINGER_PIP)
-        ring_extended = is_finger_extended(hl.landmark, mp_hands.HandLandmark.RING_FINGER_TIP, mp_hands.HandLandmark.RING_FINGER_PIP)
+        idx_extended = is_finger_extended(
+            hl.landmark,
+            mp_hands.HandLandmark.INDEX_FINGER_TIP,
+            mp_hands.HandLandmark.INDEX_FINGER_PIP
+        )
+        mid_extended = is_finger_extended(
+            hl.landmark,
+            mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
+            mp_hands.HandLandmark.MIDDLE_FINGER_PIP
+        )
+        ring_extended = is_finger_extended(
+            hl.landmark,
+            mp_hands.HandLandmark.RING_FINGER_TIP,
+            mp_hands.HandLandmark.RING_FINGER_PIP
+        )
 
         # 1 finger -> Notes
         if idx_extended and not mid_extended and not ring_extended:
@@ -616,44 +911,58 @@ def update_from_last_hand():
                 note_path = os.path.join(NOTES_DIR, "1.txt")
                 start_note_recording_thread(note_path)
 
-                # leave the [1] showing a bit then clear selection (optional)
                 def clear_sel_after_delay():
                     time.sleep(1.0)
                     STATE.sidebar_selection = None
                 threading.Thread(target=clear_sel_after_delay, daemon=True).start()
 
-        # 2 fingers (index+middle) -> Drawing (placeholder)
+        # 2 fingers -> Drawing
         elif idx_extended and mid_extended and not ring_extended:
             if STATE.sidebar_selection != 2:
                 STATE.sidebar_selection = 2
                 STATE.last_action_message = "Selected Drawing (2)."
                 speak("Drawing selected")
+
                 def clear_sel_after_delay():
                     time.sleep(1.0)
                     STATE.sidebar_selection = None
                 threading.Thread(target=clear_sel_after_delay, daemon=True).start()
 
-        # 3 fingers (index+middle+ring) -> Close Sidebar (NOT exit application)
+        # 3 fingers -> Close Sidebar
         elif idx_extended and mid_extended and ring_extended:
             if STATE.sidebar_selection != 3:
                 STATE.sidebar_selection = 3
                 STATE.last_action_message = "Selected Close Sidebar (3). Closing sidebar..."
                 speak("Closing sidebar")
-                # close sidebar (do NOT exit program)
                 STATE.sidebar_open = False
                 STATE.sidebar_target_x = -300
 
-                # clear selection after a moment so UI resets
                 def clear_sel_and_message():
                     time.sleep(0.6)
                     STATE.sidebar_selection = None
                     STATE.last_action_message = ""
                 threading.Thread(target=clear_sel_and_message, daemon=True).start()
         else:
-            # no clear selection, leave selection as-is (or clear if you prefer)
             pass
+        updated = False
+        prev_state = shared_state.copy()
 
-        # when sidebar open we do not rotate/zoom the object
+        # Example for left/right/up/down rotation gestures:
+        if gesture == "LEFT":
+            shared_state["rot_y"] -= rotate_amount
+            updated = True
+        elif gesture == "RIGHT":
+            shared_state["rot_y"] += rotate_amount
+            updated = True
+        elif gesture == "UP":
+            shared_state["rot_x"] -= rotate_amount
+            updated = True
+        elif gesture == "DOWN":
+            shared_state["rot_x"] += rotate_amount
+            updated = True
+
+        if updated:
+            broadcast_state(throttle=0)
         STATE.current_gesture = f"{extended_count}fingers (sidebar)"
         return
 
@@ -662,12 +971,38 @@ def update_from_last_hand():
     STATE.current_gesture = gesture or f"{extended_count}fingers"
     rotate_amount = 2.0
     zoom_amount = 0.2
-    if gesture=="LEFT": STATE.view.rot_y -= rotate_amount
-    elif gesture=="RIGHT": STATE.view.rot_y += rotate_amount
-    elif gesture=="UP": STATE.view.rot_x -= rotate_amount
-    elif gesture=="DOWN": STATE.view.rot_x += rotate_amount
-    elif gesture=="ZOOM_IN": STATE.view.dist = clamp(STATE.view.dist - zoom_amount, 1.0, 40.0)
-    elif gesture=="ZOOM_OUT": STATE.view.dist = clamp(STATE.view.dist + zoom_amount, 1.0, 40.0)
+
+    updated = False
+    prev_state = shared_state.copy()
+
+    updated = False
+    if gesture == "LEFT":
+        shared_state["rot_y"] -= rotate_amount
+        updated = True
+    elif gesture == "RIGHT":
+        shared_state["rot_y"] += rotate_amount
+        updated = True
+    elif gesture == "UP":
+        shared_state["rot_x"] -= rotate_amount
+        updated = True
+    elif gesture == "DOWN":
+        shared_state["rot_x"] += rotate_amount
+        updated = True
+    elif gesture == "ZOOM_IN":
+        shared_state["dist"] = clamp(shared_state["dist"] - zoom_amount, 1.0, 40.0)
+        updated = True
+    elif gesture == "ZOOM_OUT":
+        shared_state["dist"] = clamp(shared_state["dist"] + zoom_amount, 1.0, 40.0)
+        updated = True
+
+    if updated:
+        alerts = run_safety_checks(prev_state, shared_state)
+        shared_state["alerts"] = alerts
+        if alerts:
+            STATE.last_action_message = alerts[0]
+            speak(alerts[0])
+        broadcast_state()
+
 
 # ---------------- GLUT timer ----------------
 def timer_func(value):
@@ -712,72 +1047,84 @@ atexit.register(lambda:setattr(STATE,'running',False))
 
 # ---------------- Tkinter launcher ----------------
 class LauncherUI:
-    def __init__(self,master):
-        self.master=master
+    def __init__(self, master):
+        self.master = master
         master.title("Hand-Tracked 3D Viewer")
         master.geometry("540x360")
-        frm=ttk.Frame(master,padding=12)
-        frm.pack(fill='both',expand=True)
-        self.model_label=tk.StringVar(value="No model selected")
-        ttk.Label(frm,textvariable=self.model_label).pack(anchor='w')
-        ttk.Button(frm,text="Load OBJ",command=self.choose_model).pack(fill='x',pady=4)
-        # --- background image section
-        self.bgimg_label=tk.StringVar(value="No background image")
-        ttk.Label(frm,textvariable=self.bgimg_label).pack(anchor='w')
-        ttk.Button(frm,text="Choose Background",command=self.choose_bg_image).pack(fill='x',pady=4)
-        # --- notes info
+        frm = ttk.Frame(master, padding=12)
+        frm.pack(fill='both', expand=True)
+
+        self.model_label = tk.StringVar(value="No model selected")
+        ttk.Label(frm, textvariable=self.model_label).pack(anchor='w')
+        ttk.Button(frm, text="Load OBJ", command=self.choose_model).pack(fill='x', pady=4)
+
+        self.mtl_label = tk.StringVar(value="No MTL selected For Transfering")
+        ttk.Label(frm, textvariable=self.mtl_label).pack(anchor='w')
+        ttk.Button(frm, text="Send Extra", command=self.choose_extra).pack(fill='x', pady=4)
+
+        self.bgimg_label = tk.StringVar(value="No background image")
+        ttk.Label(frm, textvariable=self.bgimg_label).pack(anchor='w')
+        ttk.Button(frm, text="Choose Background", command=self.choose_bg_image).pack(fill='x', pady=4)
+
         ttk.Label(frm, text="Notes folder: " + NOTES_DIR).pack(anchor='w', pady=(6,0))
-        # --- 
-        ttk.Button(frm,text="Start Viewer",command=self.start_viewer).pack(fill='x',pady=8)
-        ttk.Separator(frm).pack(fill='x',pady=6)
-        self.proc_every=tk.IntVar(value=MEDIAPIPE_EVERY_N)
-        ttk.Label(frm,text="Mediapipe cadence (1 = every frame, 2 = every 2 frames):").pack(anchor='w')
-        ttk.Spinbox(frm, from_=1,to=10,textvariable=self.proc_every,width=6).pack(anchor='w')
-        self.debug_win=tk.BooleanVar(value=SHOW_DEBUG_WINDOW)
-        ttk.Checkbutton(frm,text="Show camera debug window (slower)",variable=self.debug_win).pack(anchor='w',pady=4)
-        ttk.Label(frm,text="Gestures: Fist=open sidebar, 3 fingers=close sidebar. In sidebar: 1=index, 2=index+middle, 3=index+middle+ring").pack(anchor='w',pady=(6,0))
-        self.model_path = None
+        ttk.Button(frm, text="Start Viewer", command=self.start_viewer).pack(fill='x', pady=8)
+        ttk.Separator(frm).pack(fill='x', pady=6)
+        self.proc_every = tk.IntVar(value=MEDIAPIPE_EVERY_N)
+
+    def choose_extra(self):
+        """Prompt user to select one or more 'extra' files (any type) for transfer"""
+        paths = filedialog.askopenfilenames(title="Select Extra Files", filetypes=[("All Files", "*.*")])
+        if paths:
+            self.selected_extra_files = list(paths)
+            self.mtl_label.set(f"{len(paths)} file(s) selected for transfer.")
+        else:
+            self.selected_extra_files = []
+            self.mtl_label.set("No Extra selected For Transfering")
+
+
 
     def choose_model(self):
-        path = filedialog.askopenfilename(title="Select OBJ",filetypes=[("OBJ","*.obj")])
+        path=filedialog.askopenfilename(title="Select OBJ",filetypes=[("OBJ","*.obj")])
         if path: 
             self.model_path=path
             self.model_label.set(os.path.basename(path))
-    
+
     def choose_bg_image(self):
-        path = filedialog.askopenfilename(title="Select Background Image", filetypes=[("Image Files","*.png;*.jpg;*.jpeg;*.bmp")])
+        path=filedialog.askopenfilename(title="Select Background Image", filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp")])
         if path:
-            STATE.bg_image_path = path
+            STATE.bg_image_path=path
             self.bgimg_label.set(os.path.basename(path))
-    
+
     def start_viewer(self):
         global MEDIAPIPE_EVERY_N, SHOW_DEBUG_WINDOW
         try: MEDIAPIPE_EVERY_N=max(1,int(self.proc_every.get()))
-        except Exception: MEDIAPIPE_EVERY_N=2
-        SHOW_DEBUG_WINDOW=bool(self.debug_win.get())
-        if getattr(self,'model_path',None): load_obj(self.model_path)
-        t=threading.Thread(target=camera_worker,daemon=True)
-        t.start()
+        except: MEDIAPIPE_EVERY_N=2
+        # SHOW_DEBUG_WINDOW=bool(self.debug_win.get())
+        if self.model_path:
+            load_obj(self.model_path)
+            send_model_to_clients(self.model_path)
+        threading.Thread(target=camera_worker,daemon=True).start()
         self.master.destroy()
         run_glut()
 
-# ---------------- GLUT runner ----------------
+        
 def run_glut():
     glutInit(sys.argv)
-    glutInitDisplayMode(GLUT_RGBA|GLUT_DOUBLE|GLUT_DEPTH)
-    glutInitWindowSize(WINDOW_W,WINDOW_H)
+    glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE | GLUT_DEPTH)
+    glutInitWindowSize(WINDOW_W, WINDOW_H)
     glutCreateWindow(b"Hand-Tracked 3D Viewer")
-    init_gl(WINDOW_W,WINDOW_H)
-    # --- upload background after context, if requested
-    if STATE.bg_image_path:
-        load_background_image(STATE.bg_image_path)
-    glutDisplayFunc(display)
-    glutKeyboardFunc(keyboard)
-    glutTimerFunc(int(1000.0/TARGET_FPS), timer_func,0)
-    glutMainLoop()
 
-# ---------------- main ----------------
-if __name__=="__main__":
-    root=tk.Tk()
-    LauncherUI(root)
+    init_gl(WINDOW_W, WINDOW_H)
+
+    # Callbacks
+    glutDisplayFunc(display)
+    glutReshapeFunc(resize_gl)
+    glutKeyboardFunc(keyboard)
+    glutTimerFunc(int(1000.0 / TARGET_FPS), timer_func, 0)
+
+    # Enter main loop
+    glutMainLoop()
+if __name__ == "__main__":
+    root = tk.Tk()
+    ui = LauncherUI(root)
     root.mainloop()
