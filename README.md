@@ -38,16 +38,6 @@ Built with **Python, OpenGL, MediaPipe, and Socket.IO**, this project allows mul
 
 ---
 
-## 📂 Project Structure
-
-├── main.py # Core application (OpenGL + UI + networking)
-├── requirements.txt # Dependencies
-├── notes/ # Saved user notes
-└── assets/ # Sample 3D models and textures
-
-
----
-
 ## 📦 Dependencies
 
 - **opencv-python** – Camera input  
